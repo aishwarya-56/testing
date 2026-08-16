@@ -1,0 +1,427 @@
+# Motor Insurance Surveyor Dispatcher Engine — Discovery & Architecture Planning
+
+I want to build a production-ready **Motor Insurance Surveyor Dispatcher Engine** in **Python using FastAPI**.
+
+At this stage, **DO NOT implement the application or write production code yet**.
+
+Your task is to thoroughly understand the requirements, inspect the available project files/context, identify ambiguities and missing decisions, and propose a detailed architecture and implementation plan.
+
+## 1. Project Objective
+
+The application will receive a motor accident/insurance claim request through a FastAPI API.
+
+The request will contain accident location details, as shown in the provided `input_sample.json`.
+
+The application must determine the most appropriate surveyor to dispatch by considering:
+
+* Surveyor availability
+* Surveyor location
+* Geographic distance from the accident location
+* Surveyor type
+* Surveyor working/shift timing
+* Tier-specific geographic search radius
+* Tier-specific notification and acceptance timeout
+* Surveyor acceptance/rejection/timeout
+* Distance-based candidate prioritization
+* Configurable number of surveyors to notify for each tier
+
+The dispatcher should progress through multiple tiers until a surveyor accepts the request or no eligible surveyor remains.
+
+## 2. Business Rules
+
+The dispatcher has three tiers.
+
+### Tier 1
+
+* Configurable search radius
+* Default radius: **10 km**
+* Notify only **INTERNAL** surveyors
+* Configurable acceptance timeout
+* Default timeout: **120 seconds**
+
+### Tier 2
+
+* Configurable search radius
+* Default radius: **15 km**
+* Notify only **INTERNAL** surveyors
+* Configurable acceptance timeout
+* Default timeout: **60 seconds**
+
+### Tier 3
+
+* Configurable search radius
+* Default radius: **15 km**
+* Notify both:
+
+  * INTERNAL surveyors
+  * EXTERNAL surveyors
+* Configurable acceptance timeout
+* Default timeout: **60 seconds**
+
+For each tier:
+
+1. Find eligible surveyors within the configured search radius.
+2. Filter surveyors based on availability.
+3. Filter surveyors based on their shift/working time.
+4. Filter surveyors based on surveyor type applicable to the tier.
+5. Sort the combined INTERNAL + EXTERNAL candidate set by distance from the accident location.
+6. Select the configured number of candidates.
+7. Notify the selected candidates.
+8. Wait for the configured acceptance timeout.
+9. If a candidate accepts, stop the dispatch process and return the accepted surveyor.
+10. If nobody accepts before the timeout, move to the next tier.
+11. If there are no eligible candidates in the current tier, immediately move to the next tier.
+12. If there are no candidates remaining in any tier, return an appropriate "no surveyor available" result.
+
+The **combined candidate set must be sorted by distance before selecting the N candidates**.
+
+A candidate is considered eligible when:
+
+```text
+availability == Available
+AND
+the surveyor is currently within their working shift
+AND
+the surveyor type is allowed for the current tier
+AND
+the surveyor is within the configured tier search radius
+```
+
+The dispatcher should maintain the configured buffer/logic around surveyor shifts so that a surveyor whose shift is about to expire can be handled appropriately. Please identify any ambiguity in this requirement and ask for clarification if necessary.
+
+## 3. Distance Calculation
+
+Initially, use the **Haversine distance** between:
+
+* Accident location
+* Surveyor location
+
+for filtering and sorting candidates.
+
+However, the design must be modular enough that the distance calculation/recommendation mechanism can later be replaced with **route distance**, such as distance obtained from a mapping/routing service.
+
+Do not tightly couple the dispatcher business logic to the Haversine implementation.
+
+Please propose an appropriate abstraction/interface for this.
+
+## 4. Surveyor Data Source
+
+In production, surveyor details will come from **Redis**.
+
+However, Redis is **not available for the initial implementation**.
+
+There is a reference project/component called:
+
+`redis_surveyor_simulator.py`
+
+Use this simulator to provide the surveyor data for now.
+
+The simulator should behave as a temporary data provider that can later be replaced by a real Redis implementation without requiring major changes to the dispatcher business logic.
+
+Please design an appropriate repository/provider abstraction.
+
+For example, the architecture should conceptually allow:
+
+```text
+Dispatcher
+    ↓
+Surveyor Repository / Provider Interface
+    ↓
+Simulator implementation
+
+Later:
+
+Dispatcher
+    ↓
+Surveyor Repository / Provider Interface
+    ↓
+Redis implementation
+```
+
+The Redis connection should be created/reused appropriately and **must not create a new Redis connection for every incoming API request**.
+
+The connection/data-access design should be production-ready and allow the Redis implementation to be introduced later with minimal changes.
+
+## 5. Concurrent Requests
+
+The FastAPI application must safely support **multiple concurrent claim/dispatch requests**.
+
+Please specifically analyze:
+
+* Async vs synchronous implementation
+* Concurrent dispatch requests
+* Shared resources/state
+* Surveyor availability updates
+* Race conditions
+* Multiple claims attempting to dispatch the same surveyor
+* Notification/acceptance handling
+* Timeout handling
+* Cancellation
+* Idempotency
+* Thread/process safety
+
+Recommend an appropriate design for these concerns.
+
+## 6. Notifications and Acceptance
+
+The dispatcher should notify selected surveyors and wait for their acceptance/rejection.
+
+For this initial implementation, the notification mechanism can be simulated/mocked.
+
+However, the architecture should make the notification mechanism replaceable in the future.
+
+Please propose abstractions for:
+
+* Sending a notification
+* Receiving/recording acceptance
+* Receiving/recording rejection
+* Handling acceptance timeout
+
+The dispatcher should stop as soon as an eligible surveyor accepts.
+
+Please consider what happens if multiple surveyors accept at nearly the same time and recommend how to ensure that only one surveyor wins the dispatch.
+
+## 7. Audit and Logging
+
+The application must maintain comprehensive structured logs and audit information.
+
+The audit trail should capture important dispatcher events such as:
+
+* Claim/request received
+* Request validation result
+* Tier started
+* Candidate surveyors identified
+* Candidate filtering decisions
+* Distances calculated
+* Candidates selected
+* Notifications sent
+* Surveyor acceptance
+* Surveyor rejection
+* Acceptance timeout
+* Tier transition
+* Dispatch success
+* Dispatch failure/no eligible surveyor
+* Errors/exceptions
+
+Please recommend:
+
+* Structured logging format
+* Appropriate log fields/correlation IDs
+* Audit data model
+* What information should be logged vs avoided
+* How to make a request traceable across the complete dispatch lifecycle
+
+## 8. Automated Testing
+
+The project must have comprehensive automated tests.
+
+Please plan for tests covering at minimum:
+
+* Request validation
+* Haversine distance calculation
+* Radius filtering
+* Availability filtering
+* Shift/working-time filtering
+* Surveyor-type filtering
+* Candidate sorting
+* Candidate selection
+* Tier 1 behavior
+* Tier 2 behavior
+* Tier 3 behavior
+* Timeout behavior
+* Tier transition
+* No-candidate scenarios
+* Successful acceptance
+* Multiple concurrent requests
+* Concurrent surveyor acceptance/race conditions
+* Error handling
+* Repository/provider abstraction
+* Notification behavior
+
+Please recommend an appropriate testing strategy and framework.
+
+## 9. Production-Readiness
+
+Although Redis and real notification infrastructure are not available initially, the application should be designed as a **production-ready first-cut implementation**.
+
+Consider:
+
+* Clean architecture
+* Separation of concerns
+* Dependency injection
+* Configuration management
+* Environment variables
+* Type hints
+* Validation
+* Error handling
+* Async/concurrency
+* Structured logging
+* Auditability
+* Testability
+* Extensibility
+* Observability
+* API design
+* Graceful shutdown
+* Resource lifecycle management
+
+Avoid unnecessary complexity, but don't sacrifice good architectural boundaries.
+
+## 10. Existing Project Context
+
+Before making architectural decisions, inspect the files in the project, especially:
+
+* `input_sample.json`
+* `redis_surveyor_simulator.py`
+* The `project context` folder
+* Any existing architecture diagrams/reference projects
+* Any existing code or configuration
+
+There is a reference project in the `project context` folder. It is called the **Tier Finder application**.
+
+Use it as a reference for understanding the intended architecture and domain behavior where appropriate, but **do not blindly copy its implementation**.
+
+Identify which ideas are reusable and which should be redesigned for this dispatcher application.
+
+## 11. Configuration
+
+The following values should be configurable rather than hard-coded:
+
+* Tier search radius
+* Acceptance timeout
+* Number of surveyors to notify
+* Shift buffer
+* Other operational settings that you believe should be configurable
+
+Please propose an appropriate configuration structure.
+
+Use the following defaults from the requirements:
+
+```text
+Tier 1:
+  radius = 10 km
+  surveyor type = INTERNAL
+  acceptance timeout = 120 seconds
+
+Tier 2:
+  radius = 15 km
+  surveyor type = INTERNAL
+  acceptance timeout = 60 seconds
+
+Tier 3:
+  radius = 15 km
+  surveyor types = INTERNAL + EXTERNAL
+  acceptance timeout = 60 seconds
+```
+
+## 12. What I Want From You Now
+
+Again, **do not implement the application yet**.
+
+First perform a complete discovery and planning exercise.
+
+Please provide:
+
+### A. Requirements Summary
+
+Restate your understanding of the functional and non-functional requirements.
+
+### B. Assumptions
+
+List every assumption you had to make.
+
+Clearly distinguish assumptions from explicit requirements.
+
+### C. Clarifying Questions
+
+Identify anything that is ambiguous or could materially affect the architecture or implementation.
+
+Ask me the questions before proceeding where appropriate.
+
+### D. Architecture Proposal
+
+Propose a production-ready architecture, including:
+
+* Application layers
+* Modules/packages
+* Domain models
+* Services
+* Repository/provider abstractions
+* Distance calculation abstraction
+* Notification abstraction
+* Acceptance handling
+* Configuration
+* Logging
+* Audit
+* API layer
+
+### E. Project Structure
+
+Propose the expected directory/file structure.
+
+For example, conceptually:
+
+```text
+app/
+    api/
+    domain/
+    services/
+    repositories/
+    infrastructure/
+    models/
+    core/
+    ...
+tests/
+...
+```
+
+Do not create these files yet unless necessary for inspection.
+
+### F. Request/Response API Design
+
+Propose the initial FastAPI endpoints, request models, response models, and error responses.
+
+Use `input_sample.json` to understand the input format.
+
+### G. Dispatch Algorithm
+
+Describe the dispatcher flow step-by-step, including tier transitions, filtering, sorting, notification, timeout, and acceptance handling.
+
+### H. Concurrency Strategy
+
+Explain how the application should safely handle concurrent requests and simultaneous surveyor acceptance.
+
+### I. Testing Strategy
+
+Provide a test strategy and list the important unit, integration, and concurrency tests.
+
+### J. Implementation Plan
+
+Break implementation into logical phases that can later be executed incrementally.
+
+For example:
+
+```text
+Phase 1 — Project foundation
+Phase 2 — Domain models
+Phase 3 — Surveyor provider/simulator
+Phase 4 — Distance calculation
+Phase 5 — Tier dispatcher
+Phase 6 — Notification/acceptance simulation
+Phase 7 — API integration
+Phase 8 — Logging/audit
+Phase 9 — Testing
+Phase 10 — Production hardening
+```
+
+Adjust these phases based on your analysis.
+
+### K. Documentation Plan
+
+Recommend what should eventually be included in:
+
+* `CLAUDE.md`
+* `README.md`
+* API documentation
+* Architecture documentation
+
+At this stage, focus on analysis and planning. Do not start implementing until I review and approve the proposed architecture and plan.
