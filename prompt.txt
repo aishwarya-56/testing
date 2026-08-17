@@ -1,0 +1,2020 @@
+# Build Motor Insurance Surveyor Dispatcher
+
+You are an experienced Python backend engineer. Build a **production-ready but intentionally simple and maintainable Motor Insurance Surveyor Dispatcher**.
+
+The goal is to create a clean first version that can run locally without Kafka or Redis, while being structured so that Kafka and Redis can later be connected with minimal changes.
+
+**Do not over-engineer this application.**
+
+Prefer:
+
+* Simple, readable Python
+* Clear separation of business logic and infrastructure
+* Small number of well-defined abstractions
+* Strong automated tests
+* Configuration-driven behavior
+* Database-backed workflow state
+* Straightforward error handling
+
+Avoid introducing unnecessary frameworks, distributed workflow engines, complex event buses, excessive design patterns, or abstractions that do not provide real value.
+
+---
+
+# 1. IMPORTANT: Inspect the Existing Repository First
+
+Before implementing anything, inspect the entire repository.
+
+Pay particular attention to:
+
+* `input_sample.json`
+* `redis_surveyor_simulator.py`
+* the `project context` folder
+* the existing **Tier Finder application**
+* existing architecture diagrams
+* existing documentation
+* existing Python code/configuration
+* existing tests
+
+Understand the existing Tier Finder application and use it as a reference where appropriate.
+
+**Do not blindly copy it.**
+
+Identify:
+
+* useful domain concepts
+* useful data models
+* relevant business logic
+* reusable patterns
+* differences between the Tier Finder application and this dispatcher
+
+Preserve useful existing code unless there is a strong reason to change it.
+
+---
+
+# 2. Application Objective
+
+Build a **Motor Insurance Surveyor Dispatcher**.
+
+The application receives a motor accident/insurance claim request containing accident location information.
+
+The dispatcher:
+
+1. Receives the claim request.
+2. Gets available surveyors.
+3. Determines eligible surveyors.
+4. Calculates their distance from the accident location.
+5. Applies tier-specific rules.
+6. Sorts candidates by distance.
+7. Selects the configured number of surveyors.
+8. Publishes a recommendation.
+9. Waits asynchronously for surveyor responses.
+10. If nobody accepts before the tier timeout, moves to the next tier.
+11. If a surveyor accepts, assigns the claim.
+12. Persists the important request, response, recommendation, and workflow state in the database.
+
+The eventual production flow is:
+
+```text
+Insurance / Claims System
+          |
+          | Claim Event
+          v
+        Kafka
+          |
+          v
+  Surveyor Dispatcher
+          |
+          +------> Redis
+          |        Surveyor Data
+          |
+          +------> Database
+          |        Request / State / Audit
+          |
+          +------> Kafka
+                   Recommendation
+```
+
+Surveyor responses will also arrive through Kafka:
+
+```text
+Surveyor / Notification System
+          |
+          | ACCEPTED / REJECTED
+          v
+        Kafka
+          |
+          v
+  Surveyor Dispatcher
+```
+
+---
+
+# 3. Core Architecture Principle
+
+The most important architectural requirement is:
+
+> **The dispatcher business logic must not depend directly on FastAPI, Kafka, Redis, or a specific database implementation.**
+
+The core dispatcher should be reusable from:
+
+* FastAPI local mode
+* Kafka production mode
+* automated tests
+
+Conceptually:
+
+```text
+                  Dispatcher Core
+                       |
+          ┌────────────┼────────────┐
+          |            |            |
+          v            v            v
+     Surveyor       Message      Persistence
+      Provider      Publisher     Repository
+          |            |            |
+      ┌───┴───┐    ┌───┴───┐    ┌──┴────┐
+      |       |    |       |    |       |
+    Memory  Redis Local   Kafka SQLite/Postgres
+```
+
+Use simple interfaces/protocols where they provide value.
+
+Do not create abstractions for everything.
+
+---
+
+# 4. Two Runtime Modes
+
+The application must support two modes.
+
+## Mode A — Local / Demo
+
+This must work **without Kafka and without Redis**.
+
+Use:
+
+* FastAPI
+* generated/in-memory surveyor data
+* local database
+* local message handling
+* configurable short timeouts for demonstrations
+
+This mode allows the complete dispatcher workflow to be demonstrated.
+
+For example:
+
+```text
+POST /claims
+      |
+      v
+Dispatcher
+      |
+      v
+Generated Surveyors
+      |
+      v
+Tier 1
+      |
+      v
+Recommendation
+      |
+      v
+Simulated Response
+      |
+      v
+Assignment
+```
+
+It must also be possible to demonstrate:
+
+```text
+Tier 1
+  |
+  | timeout
+  v
+Tier 2
+  |
+  | timeout
+  v
+Tier 3
+  |
+  v
+Success / Failure
+```
+
+---
+
+## Mode B — Production / Kafka + Redis
+
+Production uses:
+
+```text
+Kafka
+  |
+  v
+Kafka Consumer
+  |
+  v
+Dispatcher Core
+  |
+  +---- Redis Surveyor Provider
+  |
+  +---- Database
+  |
+  v
+Kafka Producer
+```
+
+The same dispatcher logic must be reused.
+
+Only infrastructure adapters should change.
+
+---
+
+# 5. Configuration
+
+Use **YAML as the primary application configuration format**.
+
+Do NOT scatter configuration values throughout the code.
+
+Create a configuration structure such as:
+
+```text
+config/
+    config.yaml
+```
+
+Optionally support environment-specific configuration later, for example:
+
+```text
+config/
+    config.yaml
+    config.local.yaml
+    config.prod.yaml
+```
+
+Do not create multiple configuration files unless there is a clear benefit.
+
+Use `.env` / environment variables for:
+
+* secrets
+* passwords
+* credentials
+* deployment-specific overrides
+* values that should not be committed to Git
+
+Provide:
+
+```text
+.env.example
+```
+
+Never commit actual secrets.
+
+Load configuration once through a typed configuration/settings module.
+
+The application should expose a typed configuration object to the rest of the application.
+
+---
+
+# 6. Example Configuration
+
+Use a structure similar to:
+
+```yaml
+app:
+  name: surveyor-dispatcher
+  environment: local
+
+database:
+  url: sqlite:///./dispatcher.db
+
+kafka:
+  enabled: false
+  bootstrap_servers: localhost:9092
+
+  consumer_group: surveyor-dispatcher
+
+  topics:
+    claim_requests: claim.requests
+    recommendations: surveyor.recommendations
+    surveyor_responses: surveyor.responses
+    dispatch_events: dispatch.events
+
+redis:
+  enabled: false
+  url: redis://localhost:6379
+
+surveyor:
+  provider: memory
+
+dispatcher:
+  shift_buffer_minutes: 15
+
+  tiers:
+    tier1:
+      radius_km: 10
+      timeout_seconds: 120
+      candidate_count: 2
+      surveyor_types:
+        - INTERNAL
+
+    tier2:
+      radius_km: 15
+      timeout_seconds: 60
+      candidate_count: 2
+      surveyor_types:
+        - INTERNAL
+
+    tier3:
+      radius_km: 15
+      timeout_seconds: 60
+      candidate_count: 3
+      surveyor_types:
+        - INTERNAL
+        - EXTERNAL
+```
+
+Adjust this structure based on the existing project and requirements.
+
+For local demos, allow short timeout values such as:
+
+```yaml
+timeout_seconds: 10
+```
+
+so that tier progression can be demonstrated quickly.
+
+---
+
+# 7. Secrets
+
+Do not put secrets in committed YAML files.
+
+For example:
+
+```text
+.env
+
+REDIS_PASSWORD=...
+KAFKA_USERNAME=...
+KAFKA_PASSWORD=...
+DATABASE_PASSWORD=...
+```
+
+Document how environment variables override configuration where appropriate.
+
+Use a sensible configuration precedence such as:
+
+```text
+Default values
+      ↓
+config.yaml
+      ↓
+environment-specific YAML
+      ↓
+environment variables / secrets
+```
+
+Keep this simple.
+
+---
+
+# 8. Kafka Architecture
+
+Kafka is the **primary production business-event interface**.
+
+The application must consume claim requests from a configurable Kafka topic.
+
+Default:
+
+```text
+claim.requests
+```
+
+It must publish recommendations to:
+
+```text
+surveyor.recommendations
+```
+
+It must consume surveyor responses from:
+
+```text
+surveyor.responses
+```
+
+Optionally publish important lifecycle events to:
+
+```text
+dispatch.events
+```
+
+Make topic names configurable through YAML.
+
+---
+
+# 9. Kafka Claim Request
+
+Use the actual structure in:
+
+```text
+input_sample.json
+```
+
+Do not invent a completely different claim format if the existing sample defines the required structure.
+
+The message should contain the claim/request identity and accident location.
+
+Conceptually:
+
+```json
+{
+  "claim_id": "CLM-001",
+  "accident_location": {
+    "latitude": 12.9716,
+    "longitude": 77.5946
+  }
+}
+```
+
+Adapt this to the actual input sample.
+
+---
+
+# 10. Kafka Recommendation Message
+
+Publish a clear recommendation message.
+
+Conceptually:
+
+```json
+{
+  "event_id": "uuid",
+  "claim_id": "CLM-001",
+  "tier": 1,
+  "candidates": [
+    {
+      "surveyor_id": "S001",
+      "distance_km": 4.2
+    },
+    {
+      "surveyor_id": "S002",
+      "distance_km": 5.7
+    }
+  ],
+  "acceptance_timeout_seconds": 120,
+  "created_at": "..."
+}
+```
+
+Include only useful fields.
+
+The final schema should be based on the actual project requirements and existing reference implementation.
+
+---
+
+# 11. Surveyor Response Message
+
+Support surveyor response events such as:
+
+```json
+{
+  "event_id": "uuid",
+  "claim_id": "CLM-001",
+  "tier": 1,
+  "surveyor_id": "S001",
+  "response": "ACCEPTED",
+  "created_at": "..."
+}
+```
+
+and:
+
+```json
+{
+  "event_id": "uuid",
+  "claim_id": "CLM-001",
+  "tier": 1,
+  "surveyor_id": "S001",
+  "response": "REJECTED",
+  "created_at": "..."
+}
+```
+
+Adapt the schema if the reference project defines a better format.
+
+---
+
+# 12. Kafka Consumer
+
+Implement a simple production-ready Kafka consumer.
+
+Requirements:
+
+* consumer group
+* graceful startup/shutdown
+* message validation
+* safe deserialization
+* logging
+* appropriate offset handling
+* duplicate message handling
+* no application-wide crash because of one malformed message
+* clean resource lifecycle
+
+Assume Kafka provides **at-least-once delivery**.
+
+Therefore:
+
+> The application must be idempotent.
+
+If the same claim request is received twice, it must not accidentally create two independent dispatch workflows.
+
+If the same surveyor acceptance arrives twice, it must not assign the claim twice.
+
+Use database constraints and transactions where appropriate.
+
+Do not attempt to implement complicated Kafka exactly-once semantics unless the requirements genuinely demand it.
+
+---
+
+# 13. Kafka Message Key
+
+Where appropriate, use:
+
+```text
+claim_id
+```
+
+as the Kafka message key.
+
+This helps ensure that events for the same claim are consistently routed to the same partition.
+
+Keep the implementation straightforward.
+
+---
+
+# 14. Redis Surveyor Provider
+
+In production, surveyor information comes from Redis.
+
+Create a simple provider abstraction.
+
+For example:
+
+```text
+SurveyorProvider
+    |
+    +-- InMemorySurveyorProvider
+    |
+    +-- RedisSurveyorProvider
+```
+
+The dispatcher must depend on `SurveyorProvider`, not directly on Redis.
+
+---
+
+# 15. Local Surveyor Data
+
+Until Redis is available, use generated/static surveyor data.
+
+The local provider should generate enough realistic data to demonstrate:
+
+* INTERNAL surveyors
+* EXTERNAL surveyors
+* Available surveyors
+* Unavailable surveyors
+* Different working shifts
+* Surveyors inside/outside different radii
+* Different distances from accident locations
+
+Make the generated data deterministic enough for automated tests.
+
+Provide a way to inspect or print the generated surveyors during local demos.
+
+---
+
+# 16. Redis Connection Management
+
+Do not create a Redis connection for every claim.
+
+Create/reuse the Redis client or connection pool at application level.
+
+Conceptually:
+
+```text
+Application startup
+      |
+      v
+Create Redis client/pool
+      |
+      v
+Reuse
+      |
+      v
+Application shutdown
+      |
+      v
+Close Redis client/pool
+```
+
+Local mode must start without Redis.
+
+---
+
+# 17. Database
+
+Persist important request/response/workflow data.
+
+Use:
+
+* SQLAlchemy
+* Alembic migrations
+
+Use SQLite for local development.
+
+Design the application so PostgreSQL can be used in production by changing configuration.
+
+Do not build a complicated database abstraction layer.
+
+---
+
+# 18. Database Models
+
+Create sensible models for at least:
+
+## Claim / Request
+
+Store:
+
+* claim ID
+* incoming event/message ID
+* request payload
+* status
+* correlation ID
+* created timestamp
+* updated timestamp
+
+## Dispatch
+
+Store:
+
+* claim ID
+* current tier
+* status
+* deadline
+* accepted surveyor ID
+* created/updated timestamps
+
+## Recommendation
+
+Store:
+
+* claim ID
+* tier
+* candidates
+* distances
+* recommendation event ID
+* created timestamp
+
+## Surveyor Response
+
+Store:
+
+* claim ID
+* tier
+* surveyor ID
+* response
+* event ID
+* received timestamp
+
+## Audit / Dispatch Events
+
+Store meaningful business events such as:
+
+* claim received
+* tier started
+* recommendation published
+* response received
+* timeout
+* tier transition
+* assignment
+* failure
+
+Do not put every debug log into the database.
+
+---
+
+# 19. Business Rules
+
+Implement the following rules.
+
+## Tier 1
+
+```text
+Radius: 10 km
+Surveyor type: INTERNAL
+Default timeout: 120 seconds
+```
+
+## Tier 2
+
+```text
+Radius: 15 km
+Surveyor type: INTERNAL
+Default timeout: 60 seconds
+```
+
+## Tier 3
+
+```text
+Radius: 15 km
+Surveyor types: INTERNAL + EXTERNAL
+Default timeout: 60 seconds
+```
+
+All values must be configurable.
+
+---
+
+# 20. Surveyor Eligibility
+
+A surveyor is eligible when:
+
+```text
+availability == Available
+AND
+surveyor is within working shift
+AND
+surveyor type is allowed for current tier
+AND
+distance <= configured tier radius
+```
+
+Apply the filters before candidate selection.
+
+Use the configured shift buffer if the existing requirements/reference implementation define one.
+
+If there is ambiguity, inspect the reference project and make a reasonable documented decision.
+
+---
+
+# 21. Distance Calculation
+
+Initially use the **Haversine formula**.
+
+Distance must be isolated behind a small abstraction, for example:
+
+```text
+DistanceCalculator
+```
+
+with:
+
+```text
+HaversineDistanceCalculator
+```
+
+The dispatcher should not know how Haversine is calculated.
+
+This should allow a future:
+
+```text
+RouteDistanceCalculator
+```
+
+without changing tier-selection logic.
+
+Do not implement external routing now.
+
+---
+
+# 22. Candidate Selection
+
+For every tier:
+
+1. Find eligible surveyors.
+2. Calculate their distance.
+3. Apply the radius.
+4. Filter by surveyor type.
+5. Combine eligible candidates.
+6. Sort the complete candidate list by distance ascending.
+7. Select the configured number of candidates.
+
+Important:
+
+> For Tier 3, INTERNAL and EXTERNAL surveyors must be combined and sorted by distance **before** selecting N candidates.
+
+Do not select INTERNAL candidates first and then append EXTERNAL candidates.
+
+---
+
+# 23. Number of Candidates
+
+Make this configurable per tier.
+
+For example:
+
+```yaml
+dispatcher:
+  tiers:
+    tier1:
+      candidate_count: 2
+
+    tier2:
+      candidate_count: 2
+
+    tier3:
+      candidate_count: 3
+```
+
+Use sensible defaults based on the requirements/reference project.
+
+---
+
+# 24. Dispatch State Machine
+
+Use a simple explicit state model.
+
+For example:
+
+```text
+NEW
+ |
+ v
+TIER_1
+ |
+ v
+WAITING_FOR_RESPONSE
+ |
+ +---- ACCEPTED ------> ASSIGNED
+ |
+ +---- REJECTED ------> next tier / failure
+ |
+ +---- TIMEOUT -------> TIER_2
+                          |
+                          v
+                       TIER_3
+                          |
+                          +---- ASSIGNED
+                          |
+                          +---- FAILED
+```
+
+Do not use a state-machine framework.
+
+A simple enum + service logic is sufficient.
+
+---
+
+# 25. Event-Driven Timeout — Critical Requirement
+
+Do NOT implement:
+
+```python
+time.sleep(120)
+```
+
+to wait for surveyor acceptance.
+
+Do not block a worker/request for the entire timeout.
+
+Instead:
+
+1. Create recommendation.
+2. Persist current tier.
+3. Persist a deadline.
+4. Publish recommendation to Kafka.
+5. Wait for acceptance/rejection events asynchronously.
+6. Detect expired deadlines.
+7. Generate a timeout event/transition.
+8. Move to the next tier.
+
+For example:
+
+```text
+Recommendation created
+        |
+        v
+DB:
+tier = 1
+status = WAITING_FOR_RESPONSE
+deadline = now + 120 seconds
+        |
+        v
+Kafka recommendation
+        |
+        v
+Wait for events
+        |
+        +---- ACCEPTED ---> ASSIGNED
+        |
+        +---- REJECTED ---> continue
+        |
+        +---- deadline ---> TIER 2
+```
+
+---
+
+# 26. Restart-Safe Timeout
+
+The timeout mechanism must survive application restarts.
+
+Do NOT rely solely on:
+
+```text
+in-memory timer
+```
+
+because it disappears when the application crashes.
+
+Instead, persist:
+
+```text
+deadline
+```
+
+in the database.
+
+Use a lightweight background task that periodically finds:
+
+```text
+status = WAITING_FOR_RESPONSE
+AND
+deadline <= current_time
+```
+
+and processes those dispatches.
+
+This is acceptable for the first production-ready version.
+
+Do not introduce:
+
+* Celery
+* Kafka Streams
+* Temporal
+* Airflow
+* Redis queues
+* distributed workflow engines
+
+unless there is a demonstrated requirement.
+
+Keep the timeout worker simple.
+
+---
+
+# 27. Race Conditions
+
+Consider:
+
+```text
+Tier 1 timeout
+```
+
+and:
+
+```text
+Tier 1 surveyor acceptance
+```
+
+happening at nearly the same time.
+
+Also consider:
+
+```text
+Surveyor A accepts
+Surveyor B accepts
+```
+
+nearly simultaneously.
+
+Use database transactions/conditional updates so only one valid acceptance can win.
+
+The database must be the final consistency boundary.
+
+Do not rely only on Python locks.
+
+---
+
+# 28. Late Acceptance
+
+Example:
+
+```text
+Tier 1
+  |
+  | timeout
+  v
+Tier 2
+  |
+  v
+Tier 1 acceptance arrives late
+```
+
+The late Tier 1 acceptance must not incorrectly assign the claim.
+
+Validate:
+
+* claim status
+* current tier
+* dispatch status
+* surveyor
+* response event
+
+Record the stale response where appropriate, but do not allow it to overwrite the current workflow.
+
+Create a test for this.
+
+---
+
+# 29. Multiple Concurrent Claims
+
+The application must support multiple claims being processed concurrently.
+
+Do not store claim-specific state in global mutable Python variables.
+
+Persist workflow state in the database.
+
+The dispatcher should be safe when:
+
+```text
+Claim A
+Claim B
+Claim C
+```
+
+are being processed concurrently.
+
+Keep the concurrency design straightforward.
+
+Use async I/O where it is useful.
+
+Do not make every function asynchronous without a reason.
+
+---
+
+# 30. FastAPI Local Mode
+
+Until Kafka is available, FastAPI must provide a way to exercise the dispatcher.
+
+Provide endpoints similar to:
+
+```text
+POST /claims
+POST /claims/{claim_id}/responses
+GET /claims/{claim_id}
+GET /health
+GET /ready
+```
+
+Adjust the exact API design based on the existing project.
+
+### `POST /claims`
+
+Accept the same logical claim structure as the Kafka message.
+
+It should invoke the same dispatcher service that Kafka would invoke.
+
+Do not duplicate business logic in the API layer.
+
+### `POST /claims/{claim_id}/responses`
+
+Allow local simulation of:
+
+```text
+ACCEPTED
+REJECTED
+```
+
+responses.
+
+### `GET /claims/{claim_id}`
+
+Useful for demonstrating current dispatch state.
+
+---
+
+# 31. Local Demo Workflow
+
+The following should work without Kafka or Redis:
+
+```text
+POST /claims
+      |
+      v
+Claim stored
+      |
+      v
+Tier 1
+      |
+      v
+Candidates selected
+      |
+      v
+Recommendation stored/output
+      |
+      v
+POST surveyor response
+      |
+      v
+Assignment
+```
+
+Also demonstrate:
+
+```text
+POST /claims
+      |
+      v
+Tier 1
+      |
+      | no response
+      v
+Timeout
+      |
+      v
+Tier 2
+      |
+      | no response
+      v
+Timeout
+      |
+      v
+Tier 3
+      |
+      v
+Assignment / failure
+```
+
+Use very short configurable timeout values for demo mode.
+
+For example:
+
+```yaml
+tier1:
+  timeout_seconds: 10
+```
+
+Do not require someone to wait 120 seconds during development.
+
+---
+
+# 32. Kafka Local Environment
+
+Create a minimal `docker-compose.yml`.
+
+It should allow local Kafka testing.
+
+Prefer a simple Kafka setup that is easy to start and understand.
+
+Optionally include:
+
+* Kafka
+* Redis
+* PostgreSQL
+
+But do not make Kafka/Redis/PostgreSQL mandatory for the basic FastAPI demo.
+
+The application should be able to run in:
+
+```text
+Local demo:
+FastAPI + SQLite + memory surveyors
+```
+
+and:
+
+```text
+Kafka demo:
+FastAPI + Kafka + SQLite + memory/Redis surveyors
+```
+
+and eventually:
+
+```text
+Production:
+Kafka + PostgreSQL + Redis
+```
+
+---
+
+# 33. Kafka End-to-End Demo
+
+Provide scripts or clear commands to:
+
+1. Start Kafka.
+2. Create required topics.
+3. Send a claim request.
+4. See the application consume the claim.
+5. See the recommendation published.
+6. Send an acceptance/rejection response.
+7. See the dispatcher update the workflow.
+8. Demonstrate timeout → next tier.
+
+For example:
+
+```text
+claim.requests
+      |
+      v
+Dispatcher
+      |
+      v
+surveyor.recommendations
+      |
+      v
+Simulated notification/surveyor
+      |
+      v
+surveyor.responses
+      |
+      v
+Dispatcher
+```
+
+Provide simple demo scripts where useful.
+
+---
+
+# 34. Redis End-to-End Demo
+
+Provide instructions for running Redis locally.
+
+The application should support:
+
+```yaml
+surveyor:
+  provider: memory
+```
+
+and:
+
+```yaml
+surveyor:
+  provider: redis
+```
+
+The same dispatcher logic must work in both cases.
+
+---
+
+# 35. Testing
+
+Use:
+
+```text
+pytest
+pytest-asyncio
+```
+
+where appropriate.
+
+Tests should NOT require Kafka or Redis for normal unit tests.
+
+## Unit tests
+
+Test:
+
+* request validation
+* Haversine distance
+* surveyor eligibility
+* radius
+* availability
+* shifts
+* shift buffer
+* surveyor type
+* candidate sorting
+* candidate count
+* Tier 1
+* Tier 2
+* Tier 3
+* no candidates
+* tier transitions
+
+## Workflow tests
+
+Test:
+
+* Tier 1 accepted
+* Tier 1 rejected
+* Tier 1 timeout
+* Tier 2 timeout
+* Tier 3 success
+* all tiers fail
+* late acceptance
+* multiple simultaneous acceptances
+* duplicate claim event
+* duplicate acceptance event
+* concurrent claims
+
+## API tests
+
+Test:
+
+* valid claim
+* invalid claim
+* response endpoint
+* claim status
+* health
+* readiness
+
+## Persistence tests
+
+Test:
+
+* request saved
+* dispatch saved
+* recommendation saved
+* response saved
+* audit event saved
+* state transitions
+* idempotency
+
+## Integration tests
+
+Keep a smaller set of integration tests for:
+
+```text
+Application
+    |
+    v
+Database
+```
+
+and, where practical:
+
+```text
+Application
+    |
+    v
+Kafka
+```
+
+Do not require Kafka for every test.
+
+---
+
+# 36. Idempotency
+
+Assume Kafka is at-least-once.
+
+The application must safely handle duplicates.
+
+Examples:
+
+```text
+Same claim event twice
+        |
+        v
+One dispatch workflow
+```
+
+and:
+
+```text
+Same ACCEPTED event twice
+        |
+        v
+One assignment
+```
+
+Use:
+
+* unique constraints
+* event IDs
+* claim IDs
+* database transactions
+
+where appropriate.
+
+Keep the implementation simple.
+
+---
+
+# 37. Logging
+
+Use structured logging.
+
+Every important event should be traceable through:
+
+* claim ID
+* correlation ID
+* event/message ID
+* tier
+* surveyor ID where applicable
+
+Log events such as:
+
+```text
+CLAIM_RECEIVED
+CLAIM_VALIDATED
+TIER_STARTED
+CANDIDATES_FOUND
+RECOMMENDATION_CREATED
+RECOMMENDATION_PUBLISHED
+SURVEYOR_RESPONSE_RECEIVED
+SURVEYOR_ACCEPTED
+SURVEYOR_REJECTED
+TIER_TIMEOUT
+TIER_ADVANCED
+CLAIM_ASSIGNED
+CLAIM_FAILED
+```
+
+Do not log secrets.
+
+Do not log sensitive information unnecessarily.
+
+---
+
+# 38. Error Handling
+
+Handle gracefully:
+
+* malformed Kafka messages
+* invalid API requests
+* invalid surveyor data
+* database errors
+* Redis failures
+* Kafka publish failures
+* Kafka consumer failures
+* duplicate events
+* stale responses
+* unexpected workflow states
+
+Use reasonable retries where safe.
+
+Avoid infinite retry loops.
+
+Make failures visible through logs and persisted state.
+
+---
+
+# 39. Health and Readiness
+
+Provide:
+
+```text
+GET /health
+GET /ready
+```
+
+`/health` should indicate that the process is alive.
+
+`/ready` should check required dependencies based on the current runtime configuration.
+
+For example:
+
+```text
+Local mode:
+Kafka disabled
+Redis disabled
+SQLite
+→ ready
+
+Production:
+Kafka enabled
+Redis enabled
+PostgreSQL
+→ check required dependencies
+```
+
+Do not make local mode fail because Kafka/Redis are intentionally disabled.
+
+---
+
+# 40. Graceful Shutdown
+
+Implement clean shutdown for:
+
+* Kafka consumer
+* Kafka producer
+* Redis client
+* database engine
+* timeout background task
+
+Use FastAPI lifespan mechanisms where appropriate.
+
+---
+
+# 41. Suggested Project Structure
+
+Use a clean but simple structure.
+
+For example:
+
+```text
+project/
+│
+├── app/
+│   ├── main.py
+│   │
+│   ├── api/
+│   │   ├── routes.py
+│   │   └── schemas.py
+│   │
+│   ├── core/
+│   │   ├── config.py
+│   │   └── logging.py
+│   │
+│   ├── domain/
+│   │   ├── models.py
+│   │   ├── enums.py
+│   │   └── exceptions.py
+│   │
+│   ├── dispatcher/
+│   │   ├── service.py
+│   │   └── tiers.py
+│   │
+│   ├── distance/
+│   │   ├── calculator.py
+│   │   └── haversine.py
+│   │
+│   ├── repositories/
+│   │   ├── claim.py
+│   │   ├── dispatch.py
+│   │   └── surveyor.py
+│   │
+│   └── infrastructure/
+│       ├── database/
+│       ├── kafka/
+│       ├── redis/
+│       └── surveyors/
+│
+├── tests/
+│   ├── unit/
+│   ├── api/
+│   └── integration/
+│
+├── scripts/
+│   ├── send_claim.py
+│   └── simulate_surveyor_response.py
+│
+├── config/
+│   └── config.yaml
+│
+├── alembic/
+│
+├── docker-compose.yml
+├── input_sample.json
+├── .env.example
+├── .gitignore
+├── CLAUDE.md
+├── README.md
+└── pyproject.toml
+```
+
+Adjust this if the existing project suggests a better/simple structure.
+
+Do not create unnecessary layers.
+
+---
+
+# 42. Dependency Injection
+
+Use simple dependency injection.
+
+The dispatcher should receive dependencies such as:
+
+```text
+SurveyorProvider
+DistanceCalculator
+DispatchRepository
+MessagePublisher
+```
+
+This makes testing easy.
+
+Do not introduce a dependency-injection framework.
+
+FastAPI dependency injection may be used at the API layer.
+
+---
+
+# 43. Database as Workflow Source of Truth
+
+The database should be the source of truth for:
+
+* current claim status
+* current tier
+* deadline
+* assignment
+* recommendation history
+* surveyor responses
+* important business events
+
+Do not keep the authoritative workflow state only in Python memory.
+
+This is especially important for:
+
+* application restart
+* timeout recovery
+* duplicate Kafka messages
+* concurrent processing
+
+---
+
+# 44. Production Readiness
+
+The application should have reasonable production fundamentals:
+
+* configuration management
+* environment-based secrets
+* database migrations
+* input validation
+* structured logging
+* graceful shutdown
+* idempotency
+* transaction boundaries
+* error handling
+* health/readiness endpoints
+* tests
+* type hints
+* formatting/linting
+* sensible dependency management
+* clear documentation
+
+Do not attempt to solve every possible production concern.
+
+Keep the first version understandable.
+
+---
+
+# 45. Do NOT Over-Engineer
+
+Explicitly avoid:
+
+* microservices
+* workflow engines
+* Kafka Streams
+* Celery unless genuinely required
+* distributed locks unless genuinely required
+* custom event buses
+* excessive repository layers
+* excessive factories
+* complicated caching
+* complicated retry frameworks
+* unnecessary design patterns
+
+The desired architecture is:
+
+```text
+Simple
++
+Reliable
++
+Testable
++
+Production-ready
+```
+
+not:
+
+```text
+Complex
++
+Distributed
++
+Hard to understand
+```
+
+---
+
+# 46. Implementation Strategy
+
+Implement incrementally.
+
+## Phase 1 — Repository analysis
+
+Inspect everything first.
+
+## Phase 2 — Configuration and foundation
+
+Implement:
+
+* project structure
+* YAML configuration
+* environment overrides/secrets
+* logging
+* database
+* migrations
+
+## Phase 3 — Domain logic
+
+Implement:
+
+* surveyor model
+* distance
+* eligibility
+* tier rules
+* candidate selection
+* workflow states
+
+No Kafka/Redis/FastAPI-specific logic here.
+
+## Phase 4 — Local surveyor provider
+
+Implement generated/in-memory surveyors.
+
+## Phase 5 — FastAPI local mode
+
+Implement the local API and demonstrate the complete workflow.
+
+## Phase 6 — Event-driven timeout
+
+Implement persisted deadlines and timeout processing.
+
+Test restart behavior.
+
+## Phase 7 — Kafka
+
+Implement:
+
+* consumer
+* producer
+* topics
+* message schemas
+* idempotency
+* graceful shutdown
+
+## Phase 8 — Redis
+
+Implement Redis surveyor provider.
+
+## Phase 9 — End-to-end integration
+
+Verify:
+
+```text
+Kafka
+  ↓
+Dispatcher
+  ↓
+Redis
+  ↓
+Database
+  ↓
+Kafka
+```
+
+## Phase 10 — Tests and documentation
+
+Complete tests, demo scripts, README, CLAUDE.md, and operational documentation.
+
+---
+
+# 47. Implementation Discipline
+
+Do not immediately rewrite the entire repository.
+
+For each phase:
+
+1. Inspect the current code.
+2. Explain briefly what you plan to change.
+3. Implement the smallest reasonable change.
+4. Run tests.
+5. Fix failures.
+6. Continue.
+
+Keep the application working throughout the implementation.
+
+---
+
+# 48. Definition of Done
+
+The project is complete when the following scenarios work.
+
+## Local — No Kafka/Redis
+
+I can run:
+
+```bash
+uvicorn app.main:app --reload
+```
+
+Then submit a claim.
+
+The application:
+
+```text
+Claim
+ ↓
+Generated surveyors
+ ↓
+Tier 1
+ ↓
+Recommendation
+ ↓
+Simulated acceptance
+ ↓
+Assigned
+```
+
+I can also demonstrate:
+
+```text
+Claim
+ ↓
+Tier 1
+ ↓
+Timeout
+ ↓
+Tier 2
+ ↓
+Timeout
+ ↓
+Tier 3
+ ↓
+Success / Failure
+```
+
+All important state is stored in the database.
+
+---
+
+## Kafka Mode
+
+I can start Kafka and send:
+
+```text
+claim.requests
+```
+
+The application consumes the claim.
+
+It:
+
+```text
+Consume
+ ↓
+Validate
+ ↓
+Get surveyors
+ ↓
+Apply rules
+ ↓
+Persist
+ ↓
+Publish recommendation
+```
+
+to:
+
+```text
+surveyor.recommendations
+```
+
+Then a surveyor response sent to:
+
+```text
+surveyor.responses
+```
+
+causes the dispatcher to update the workflow.
+
+A timeout causes the next tier recommendation to be published.
+
+---
+
+## Redis Mode
+
+Changing:
+
+```yaml
+surveyor:
+  provider: memory
+```
+
+to:
+
+```yaml
+surveyor:
+  provider: redis
+```
+
+should switch the surveyor data source without changing dispatcher business logic.
+
+---
+
+# 49. Documentation
+
+Create/update `README.md` with:
+
+* project overview
+* architecture
+* prerequisites
+* local setup
+* YAML configuration
+* `.env` setup
+* database setup
+* FastAPI demo
+* Kafka setup
+* Kafka topics
+* Redis setup
+* end-to-end flow
+* timeout demonstration
+* running tests
+* troubleshooting
+
+Create/update `CLAUDE.md` with:
+
+* architecture
+* important business rules
+* project structure
+* configuration conventions
+* development commands
+* testing commands
+* local vs Kafka/Redis modes
+* important design decisions
+* constraints
+* things future agents should avoid changing casually
+
+Keep `CLAUDE.md` concise and useful.
+
+---
+
+# 50. Final Output
+
+After implementation, provide:
+
+1. Architecture summary
+2. Project structure
+3. Configuration structure
+4. Kafka topic design
+5. Database models
+6. Dispatcher state flow
+7. Timeout implementation
+8. Local demo instructions
+9. Kafka demo instructions
+10. Redis setup instructions
+11. Test instructions
+12. Important assumptions
+13. Known limitations
+14. Recommended future improvements
+
+Also report:
+
+* tests executed
+* test results
+* lint/format results
+* anything that could not be tested because Kafka/Redis were unavailable
+
+---
+
+# Final Principle
+
+Build this application as a **simple production-ready first version**.
+
+The core workflow is:
+
+```text
+                 CLAIM
+                   |
+                   v
+              Kafka Event
+                   |
+                   v
+          ┌─────────────────┐
+          │    Dispatcher   │
+          └────────┬────────┘
+                   |
+             Get Surveyors
+                   |
+                   v
+              Eligibility
+                   |
+                   v
+              Distance
+                   |
+                   v
+             Tier Selection
+                   |
+                   v
+             Recommendation
+                   |
+                   v
+                 Kafka
+                   |
+                   v
+             Surveyor System
+                   |
+                   v
+          ACCEPT / REJECT EVENT
+                   |
+                   v
+              Dispatcher
+                   |
+          ┌────────┴────────┐
+          |                 |
+       ACCEPT            TIMEOUT
+          |                 |
+          v                 v
+      ASSIGNED          NEXT TIER
+                            |
+                            v
+                       Recommendation
+```
+
+The **database persists the workflow state**, Kafka transports business events, Redis provides production surveyor data, and FastAPI provides the local/demo interface.
+
+Keep the core dispatcher independent of all three infrastructure technologies.
