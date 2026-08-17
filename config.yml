@@ -1,0 +1,53 @@
+# ============================================================
+# Surveyor Dispatch Configuration
+# ============================================================
+
+dispatch:
+
+  # Maximum age of a surveyor's last location update.
+  # Surveyors whose location is older than this are ignored.
+  max_location_age_seconds: 120
+
+  tiers:
+
+    # --------------------------------------------------------
+    # Tier 1
+    # Closest internal surveyor
+    # --------------------------------------------------------
+
+    1:
+      radius_km: 10
+      notify_count: 3
+      wait_seconds: 120
+
+      surveyor_types:
+        - INTERNAL
+
+
+    # --------------------------------------------------------
+    # Tier 2
+    # Closest N internal surveyors
+    # --------------------------------------------------------
+
+    2:
+      radius_km: 15
+      notify_count: 5
+      wait_seconds: 60
+
+      surveyor_types:
+        - INTERNAL
+
+
+    # --------------------------------------------------------
+    # Tier 3
+    # Closest N surveyors regardless of type
+    # --------------------------------------------------------
+
+    3:
+      radius_km: 15
+      notify_count: 5
+      wait_seconds: 60
+
+      surveyor_types:
+        - INTERNAL
+        - OUTSOURCE
